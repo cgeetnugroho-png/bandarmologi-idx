@@ -6,6 +6,8 @@ Jalankan:  streamlit run app.py
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,6 +16,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 import bandar_core as bc
+import broker_store as bs
 
 # ------------------------------------------------------------------ tampilan
 
@@ -388,40 +391,141 @@ def page_screening(period: str) -> None:
         st.caption(f"Tidak terambil: {', '.join(failed)}")
 
 
+def page_broker_input() -> None:
+    st.markdown("# Input broker summary")
+    st.markdown(
+        '<div class="lede">Data top buyer/seller broker per saham tidak tersedia gratis dari '
+        'sumber resmi manapun — hanya lewat platform berbayar (Stockbit Pro, RTI Business, IPOT, '
+        'dsb). Salin sendiri angka yang Anda lihat di sana, tempel di sini. Data tersimpan di '
+        'Google Sheets milik Anda sendiri, bukan di server ini.</div>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    if not bs.is_configured():
+        st.warning(
+            "Google Sheets belum dikonfigurasi untuk app ini. Lihat README bagian "
+            "**Setup Broker Summary** untuk cara menghubungkannya (sekali saja)."
+        )
+        return
+
+    left, right = st.columns(2)
+    ticker_raw = left.text_input("Kode saham", value="BBCA", key="broker_ticker")
+    tanggal = right.date_input("Tanggal", value=date.today(), key="broker_date")
+    ticker = bc.display_ticker(bc.normalize_ticker(ticker_raw))
+
+    st.caption(
+        "Klik sel pertama lalu tempel (Ctrl+V) beberapa baris sekaligus dari tabel broker "
+        "summary Anda. Tambah/hapus baris sesuai kebutuhan."
+    )
+
+    template = pd.DataFrame(
+        [{"Broker": "", "Sisi": "Buy", "Lot": 0, "Nilai": 0, "AvgHarga": 0} for _ in range(10)]
+    )
+    edited = st.data_editor(
+        template,
+        num_rows="dynamic",
+        width="stretch",
+        key="broker_editor",
+        column_config={
+            "Sisi": st.column_config.SelectboxColumn("Sisi", options=["Buy", "Sell"]),
+            "Lot": st.column_config.NumberColumn("Lot"),
+            "Nilai": st.column_config.NumberColumn("Nilai (Rp)"),
+            "AvgHarga": st.column_config.NumberColumn("Avg Harga"),
+        },
+    )
+
+    if st.button("Simpan ke Google Sheets", type="primary"):
+        valid = edited[edited["Broker"].astype(str).str.strip() != ""]
+        if valid.empty:
+            st.warning("Belum ada baris terisi — minimal kolom Broker harus diisi.")
+        else:
+            with st.spinner("Menyimpan…"):
+                n = bs.save_for(ticker, tanggal.isoformat(), valid)
+            st.success(f"Tersimpan: {n} baris untuk {ticker}, {tanggal:%d %B %Y}.")
+
+
+def page_broker_view() -> None:
+    st.markdown("# Riwayat broker summary")
+    st.write("")
+
+    if not bs.is_configured():
+        st.warning(
+            "Google Sheets belum dikonfigurasi untuk app ini. Lihat README bagian "
+            "**Setup Broker Summary** untuk cara menghubungkannya (sekali saja)."
+        )
+        return
+
+    with st.spinner("Memuat data…"):
+        df = bs.load_all()
+    if df.empty:
+        st.info("Belum ada data broker summary tersimpan. Isi lewat halaman **Input broker summary**.")
+        return
+
+    df["Lot"] = pd.to_numeric(df["Lot"], errors="coerce")
+    df["Nilai"] = pd.to_numeric(df["Nilai"], errors="coerce")
+
+    tickers = sorted(df["Kode"].dropna().unique())
+    pick = st.selectbox("Pilih saham", tickers)
+    sub = df[df["Kode"] == pick].copy()
+
+    net = sub.groupby(["Tanggal", "Sisi"])["Nilai"].sum().unstack(fill_value=0)
+    net["Net"] = net.get("Buy", 0) - net.get("Sell", 0)
+    net = net.sort_index()
+
+    st.markdown(f"## Net value broker — {pick}")
+    st.caption("Positif = nilai beli lebih besar dari jual pada tanggal itu (menurut broker yang Anda input).")
+    st.bar_chart(net["Net"])
+
+    st.markdown("## Detail per tanggal")
+    tanggal_list = sorted(sub["Tanggal"].dropna().unique(), reverse=True)
+    tanggal_pick = st.selectbox("Tanggal", tanggal_list)
+    detail = sub[sub["Tanggal"] == tanggal_pick].sort_values("Nilai", ascending=False)
+    st.dataframe(detail.drop(columns=["Kode"]), hide_index=True, width="stretch")
+
+
 # ------------------------------------------------------------------ kerangka
 
 with st.sidebar:
     st.markdown("### Bandarmologi IDX")
-    mode = st.radio("Tampilan", ["Analisa satu saham", "Screening watchlist"], label_visibility="collapsed")
+    mode = st.radio(
+        "Tampilan",
+        ["Analisa satu saham", "Screening watchlist", "Input broker summary", "Riwayat broker summary"],
+        label_visibility="collapsed",
+    )
     st.divider()
 
     if mode == "Analisa satu saham":
         st.text_input("Kode saham", value="BBCA", key="single_code",
                       help="Cukup tulis kodenya, misal BBRI. Akhiran .JK ditambahkan otomatis.")
 
-    period = st.select_slider(
-        "Rentang data",
-        options=["6mo", "1y", "2y", "5y"],
-        value="1y",
-        format_func=lambda p: {"6mo": "6 bulan", "1y": "1 tahun", "2y": "2 tahun", "5y": "5 tahun"}[p],
-    )
-    profile_lookback = st.slider("Profil volume — jumlah hari", 60, 250, 120, step=10)
+    if mode in ("Analisa satu saham", "Screening watchlist"):
+        period = st.select_slider(
+            "Rentang data",
+            options=["6mo", "1y", "2y", "5y"],
+            value="1y",
+            format_func=lambda p: {"6mo": "6 bulan", "1y": "1 tahun", "2y": "2 tahun", "5y": "5 tahun"}[p],
+        )
+        profile_lookback = st.slider("Profil volume — jumlah hari", 60, 250, 120, step=10)
 
     st.divider()
     st.caption(
         "Data harga dari Yahoo Finance, tertunda sekitar 15 menit. "
-        "Tanpa broker summary, analisa ini membaca jejak pemain besar dari pola "
-        "harga dan volume, bukan dari identitas broker."
+        "Broker summary per saham diisi manual karena tidak ada sumber gratisnya — "
+        "lihat menu Input/Riwayat broker summary."
     )
 
 if mode == "Analisa satu saham":
     page_single(period, profile_lookback)
-else:
+elif mode == "Screening watchlist":
     page_screening(period)
+elif mode == "Input broker summary":
+    page_broker_input()
+else:
+    page_broker_view()
 
 st.divider()
 st.caption(
     "Alat bantu riset, bukan rekomendasi jual beli. Pola akumulasi tidak menjamin "
     "harga naik, dan semua keputusan investasi beserta risikonya ada pada Anda."
 )
-
